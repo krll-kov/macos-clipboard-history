@@ -1,0 +1,64 @@
+name: Release
+
+# Every push to the default branch builds and publishes a release
+# The tag is created by the release itself, so nothing has to be tagged by hand
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  # Patch number comes from the run counter, so every build has its own version
+  MAJOR_MINOR: "0.1"
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        run: echo "value=$MAJOR_MINOR.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the version into Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString ${{ steps.version.outputs.value }}" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion ${{ github.run_number }}" Resources/Info.plist
+
+      - name: Build
+        run: ./build.sh --universal
+
+      # ditto rather than zip: it keeps the signature and the symlinks inside
+      # the bundle
+      - name: Package
+        run: |
+          cd build
+          ditto -c -k --keepParent "Clipboard History.app" \
+            "../Clipboard-History-${{ steps.version.outputs.value }}.zip"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: v${{ steps.version.outputs.value }}
+          files: Clipboard-History-*.zip
+          generate_release_notes: true
+          body: |
+            Unpack the zip and move **Clipboard History.app** to Applications.
+
+            The app is signed locally rather than with an Apple developer
+            certificate, so the first launch is blocked. Right-click the app and
+            choose Open, or clear the quarantine flag:
+
+            ```sh
+            xattr -dr com.apple.quarantine "/Applications/Clipboard History.app"
+            ```

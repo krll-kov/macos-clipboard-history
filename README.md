@@ -250,9 +250,10 @@ A screen frame is 16 ms, so nothing here is visible while typing.
 ## Building
 
 ```sh
-./Run.command          # build a release and restart the app
-./build.sh             # build only, into build/Clipboard History.app
-swift build            # debug build
+./Run.command             # build a release and restart the app
+./build.sh                # build only, into build/Clipboard History.app
+./build.sh --universal    # both architectures, as a release is built
+swift build               # debug build
 ```
 
 ```

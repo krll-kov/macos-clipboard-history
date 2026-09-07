@@ -1,0 +1,12 @@
+name: Build
+
+# Pull requests only: a push to the default branch is built by Release instead
+on:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build.sh
