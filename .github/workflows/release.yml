@@ -28,12 +28,14 @@ jobs:
         id: version
         run: echo "value=$MAJOR_MINOR.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-      - name: Stamp the version into Info.plist
+      - name: Stamp the version and the year into Info.plist
         run: |
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleShortVersionString ${{ steps.version.outputs.value }}" Resources/Info.plist
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleVersion ${{ github.run_number }}" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :NSHumanReadableCopyright 2018-$(date +%Y) © SwiftSoft" Resources/Info.plist
 
       - name: Build
         run: ./build.sh --universal
