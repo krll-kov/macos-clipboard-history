@@ -261,20 +261,10 @@ private final class SettingsWindow: NSWindow {
   }
 
   override func performKeyEquivalent(with event: NSEvent) -> Bool {
-    if SettingsWindow.isQuit(event) {
+    if KeyName.isQuit(event) {
       close()
       return true
     }
     return super.performKeyEquivalent(with: event)
-  }
-
-  /// ⌘Q on any keyboard layout
-  ///
-  /// Matched by key code, not by character: on a Cyrillic layout ⌘Q arrives as
-  /// "й" and comparing characters never matched. Only the four real modifiers
-  /// are compared, since deviceIndependentFlagsMask also carries Caps Lock
-  static func isQuit(_ event: NSEvent) -> Bool {
-    event.type == .keyDown && Int(event.keyCode) == kVK_ANSI_Q
-      && event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command
   }
 }

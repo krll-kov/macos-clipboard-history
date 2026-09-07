@@ -51,6 +51,16 @@ final class HotKey {
 }
 
 enum KeyName {
+  /// ⌘Q on any keyboard layout
+  ///
+  /// Matched by key code, not by character: on a Cyrillic layout ⌘Q arrives as
+  /// "й" and comparing characters never matched. Only the four real modifiers
+  /// are compared, since deviceIndependentFlagsMask also carries Caps Lock
+  static func isQuit(_ event: NSEvent) -> Bool {
+    event.type == .keyDown && Int(event.keyCode) == kVK_ANSI_Q
+      && event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command
+  }
+
   static func describe(keyCode: Int, modifiers: Int) -> String {
     var parts: [String] = []
     if modifiers & Int(controlKey) != 0 { parts.append("⌃") }

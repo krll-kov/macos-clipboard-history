@@ -173,6 +173,15 @@ private final class KeyPanel: NSPanel {
 
   override func cancelOperation(_ sender: Any?) { onEscape?() }
 
+  /// ⌘Q hides the panel rather than quitting, the same as Esc
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    if KeyName.isQuit(event) {
+      onEscape?()
+      return true
+    }
+    return super.performKeyEquivalent(with: event)
+  }
+
   override func resignKey() {
     super.resignKey()
     onEscape?()
