@@ -36,11 +36,23 @@ final class ClipboardStore: ObservableObject {
   /// Bumped on every change; the list redraws from it
   @Published private(set) var generation = 0
 
+  /// Set while a bulk delete runs
+  @Published private(set) var bulk: Bulk?
+
+  struct Bulk: Equatable {
+    let title: String
+    var done: Int
+    let total: Int
+    var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
+  }
+
   private let root: URL
   private let bodies: URL
   private let database: Database
   private var pruneTimer: Timer?
   private var deletedSinceVacuum = 0
+  /// Unlinking 90 000 bodies takes longer than deleting their rows
+  private let unlink = DispatchQueue(label: "dev.swiftsoft.cliphistory.unlink", qos: .utility)
   /// Last answer given to the list, so redrawing does not repeat the query
   private var lastQuery: (key: String, generation: Int, rows: [ClipItem])?
 
@@ -384,17 +396,43 @@ final class ClipboardStore: ObservableObject {
     generation += 1
   }
 
-  func removeAll() {
-    dropRows("DELETE FROM items RETURNING file, thumb, id")
-    reclaim()
-    generation += 1
+  func removeAll() async {
+    await bulkDelete("Clearing history", total: count,
+                     "DELETE FROM items WHERE rowid IN (SELECT rowid FROM items LIMIT ?)")
   }
 
-  func removeAll(in tier: SizeTier) {
-    dropRows("DELETE FROM items WHERE band = ? RETURNING file, thumb, id", [.int(tier.band)])
-    reclaim()
-    generation += 1
+  func removeAll(in tier: SizeTier) async {
+    await bulkDelete("Clearing \(tier.title)", total: count(in: tier),
+                     """
+                     DELETE FROM items WHERE rowid IN
+                       (SELECT rowid FROM items WHERE band = ? LIMIT ?)
+                     """, [.int(tier.band)])
   }
+
+  /// Deletes in batches, yielding between them
+  ///
+  /// One statement over 90 000 entries holds the main thread for minutes
+  private func bulkDelete(_ title: String, total: Int, _ sql: String,
+                          _ values: [Database.Value] = []) async {
+    guard total > 0 else { return }
+    bulk = Bulk(title: title, done: 0, total: total)
+    defer { bulk = nil }
+
+    let statement = sql + " RETURNING file, thumb, id"
+    var done = 0
+    while true {
+      let gone = dropRows(statement, values + [.int(Self.deleteBatch)])
+      guard gone > 0 else { break }
+      done += gone
+      bulk?.done = min(done, total)
+      generation += 1
+      await Task.yield()
+      try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    await reclaim()
+  }
+
+  private static let deleteBatch = 2000
 
   /// Applies retention, maxItems and maxTotalBytes
   ///
@@ -436,7 +474,9 @@ final class ClipboardStore: ObservableObject {
 
     if dropped > 0 {
       deletedSinceVacuum += dropped
-      if deletedSinceVacuum > 5000 { reclaim() }
+      if deletedSinceVacuum > 5000 {
+        Task { await reclaim() }
+      }
       generation += 1
     }
   }
@@ -474,17 +514,38 @@ final class ClipboardStore: ObservableObject {
       if let thumb = row.optionalText(1) { files.append(thumb) }
       if let id = UUID(uuidString: row.text(2)) { ThumbnailCache.shared.drop(id) }
     }
-    for name in files {
-      try? FileManager.default.removeItem(at: bodies.appendingPathComponent(name))
+    let folder = bodies
+    unlink.async {
+      for name in files {
+        try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+      }
     }
     return gone
   }
 
-  /// Returns freed pages to the file system: 683 MB to 40 MB in 1.9 s after a
-  /// million rows were deleted
-  private func reclaim() {
-    database.run("PRAGMA incremental_vacuum")
+  /// Returns freed pages to the file system, 2000 at a time
+  ///
+  /// 683 MB back to 40 MB after a million rows; in one call that is seconds of
+  /// held main thread
+  private func reclaim() async {
     deletedSinceVacuum = 0
+    bulk = Bulk(title: "Reclaiming space", done: 0, total: freePages)
+    defer { bulk = nil }
+    let start = freePages
+    while true {
+      let before = freePages
+      guard before > 0 else { break }
+      database.run("PRAGMA incremental_vacuum(2000)")
+      let after = freePages
+      guard after < before else { break }
+      bulk?.done = start - after
+      await Task.yield()
+      try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+  }
+
+  private var freePages: Int {
+    database.first("PRAGMA freelist_count") { $0.int(0) } ?? 0
   }
 
   /// Allocated size of the whole store folder

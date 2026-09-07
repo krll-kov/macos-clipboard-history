@@ -59,10 +59,10 @@ struct SettingsView: View {
                 .frame(width: 62)
                 .disabled(store.count(in: tier) == 0)
               Button("Clear") {
-                withAnimation(.easeOut(duration: 0.18)) { store.removeAll(in: tier) }
+                Task { await store.removeAll(in: tier) }
               }
               .frame(width: 62)
-              .disabled(store.count(in: tier) == 0)
+              .disabled(store.count(in: tier) == 0 || store.bulk != nil)
             }
           }
         }
@@ -70,7 +70,7 @@ struct SettingsView: View {
 
       Section("Hard limits") {
         row("Maximum items") {
-          number($settings.maxItems, range: 100...5_000_000, step: 100)
+          number($settings.maxItems, range: 100...5_000_000, step: 1000)
         }
         row("Maximum total size") {
           HStack(spacing: 8) {
@@ -126,13 +126,16 @@ struct SettingsView: View {
         row("Everything",
             subtitle: "\(store.count) items · \(byteText(store.totalBytes))") {
           Button("Clear all", role: .destructive) {
-            withAnimation(.easeOut(duration: 0.18)) { store.removeAll() }
+            Task { await store.removeAll() }
           }
           .frame(width: 90)
+          .disabled(store.count == 0 || store.bulk != nil)
         }
       }
     }
     .formStyle(.grouped)
+    .overlay { if let bulk = store.bulk { BulkOverlay(bulk: bulk) } }
+    .animation(.easeOut(duration: 0.18), value: store.bulk)
     // The overlay scroller floats over the right edge and takes no width, so
     // the form gives back half of it on the left to look centred
     .padding(.leading, -ScrollerMetrics.overlay / 2)
@@ -192,6 +195,28 @@ struct SettingsView: View {
 
   private func byteText(_ n: Int) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+  }
+}
+
+/// Covers the window while a bulk delete runs
+struct BulkOverlay: View {
+  let bulk: ClipboardStore.Bulk
+
+  var body: some View {
+    ZStack {
+      Rectangle().fill(.ultraThinMaterial)
+      VStack(spacing: 12) {
+        ProgressView(value: bulk.fraction)
+          .progressViewStyle(.linear)
+          .frame(width: 220)
+        Text(bulk.title).font(.system(size: 13))
+        Text("\(bulk.done) of \(bulk.total)")
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+          .monospacedDigit()
+      }
+    }
+    .transition(.opacity)
   }
 }
 

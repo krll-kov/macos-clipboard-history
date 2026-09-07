@@ -172,16 +172,16 @@ final class Settings: ObservableObject {
 
   private init() {
     var registration: [String: Any] = [
-      Key.maxItems: 2000,
-      Key.maxTotalMB: 500,
+      Key.maxItems: 1_000_000,
+      Key.maxTotalMB: 20_480,
       Key.maxItemMB: 200,
       Key.captureImages: true,
-      Key.hotKeyCode: kVK_ANSI_V,
-      Key.hotKeyModifiers: Int(cmdKey | shiftKey),
-      Key.memoryDays: 1,
+      Key.hotKeyCode: kVK_ANSI_S,
+      Key.hotKeyModifiers: Int(optionKey),
+      Key.memoryDays: 3,
       Key.closeAfterPick: true,
       Key.appearance: Appearance.system.rawValue,
-      Key.totalSizeUnitIsGB: false,
+      Key.totalSizeUnitIsGB: true,
     ]
     for tier in SizeTier.allCases { registration[tier.key] = tier.defaultDays }
     defaults.register(defaults: registration)

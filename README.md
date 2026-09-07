@@ -52,7 +52,7 @@ Because the app is signed locally rather than with a developer certificate, macO
 
 ## Usage
 
-1. <kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>V</kbd> to open the panel, or click the menu bar icon and choose Open History.
+1. <kbd>⌥</kbd> + <kbd>S</kbd> to open the panel, or click the menu bar icon and choose Open History.
 2. Type to filter. Results narrow as you type; see [Search](#search) for what can be typed.
 3. <kbd>↑</kbd> <kbd>↓</kbd> to move through the list, <kbd>↵</kbd> to copy the selected entry. Clicking an entry does the same.
 4. <kbd>esc</kbd> closes the panel.
@@ -111,7 +111,7 @@ Search covers the whole history, including entries older than the quick list sho
 
 <sup>Hard limits, shortcut, appearance and storage. `Everything · 90005 items · 18,11 GB`, and the counters under each size band are read instantly at that size.</sup>
 
-**Hard limits** cap the number of entries and the total size, oldest dropped first. **Skip items larger than** refuses to capture anything above that size at all, so a copied video never enters the history.
+**Hard limits** cap the number of entries and the total size, oldest dropped first. Defaults are 1 000 000 entries and 20 GB, and the cap goes up to 5 000 000. **Skip items larger than** refuses to capture anything above that size at all, so a copied video never enters the history.
 
 **Shortcut** records a new hot key when you press one.
 
@@ -153,7 +153,7 @@ Clipboard contents marked `org.nspasteboard.ConcealedType`, which is what passwo
 Everything in the settings window is a default and can be set without opening it. The app reads these at launch:
 
 ```sh
-defaults write dev.swiftsoft.cliphistory maxItems -int 200000
+defaults write dev.swiftsoft.cliphistory maxItems -int 2000000
 defaults write dev.swiftsoft.cliphistory maxTotalMB -int 40960
 defaults write dev.swiftsoft.cliphistory maxItemMB -int 500
 defaults write dev.swiftsoft.cliphistory captureImages -bool false

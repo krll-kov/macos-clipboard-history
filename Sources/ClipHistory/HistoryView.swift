@@ -56,6 +56,8 @@ struct HistoryView: View {
     // The blur is PanelBackdrop behind this view; this tint keeps a light panel
     // over a dark desktop from reading as grey
     .background(Color(nsColor: .windowBackgroundColor).opacity(0.55))
+    .overlay { if let bulk = store.bulk { BulkOverlay(bulk: bulk) } }
+    .animation(.easeOut(duration: 0.18), value: store.bulk)
     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     .overlay(
       RoundedRectangle(cornerRadius: 10, style: .continuous)
