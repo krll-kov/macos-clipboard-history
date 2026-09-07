@@ -1,0 +1,15 @@
+# Swift Package Manager build directory
+.build/
+
+# The app bundle produced by build.sh and Run.command
+build/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# macOS
+.DS_Store
