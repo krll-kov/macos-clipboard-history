@@ -4,12 +4,19 @@ import ServiceManagement
 
 /// Size bands, each with its own retention: a line of text is cheap to keep for
 /// a year, a 100 MB screenshot is not
+///
+/// Under 1 MB text and images are separate bands, since a year of copied lines
+/// costs less than a week of screenshots
 enum SizeTier: String, CaseIterable, Codable {
-  case small, medium, large, huge
+  /// Raw value kept from before the band was split, so the retention already
+  /// chosen for it still applies to text
+  case smallText = "small"
+  case smallImage
+  case medium, large, huge
 
-  static func of(bytes: Int) -> SizeTier {
+  static func of(bytes: Int, kind: ClipItem.Kind) -> SizeTier {
     switch bytes {
-    case ..<(1 << 20): .small
+    case ..<(1 << 20): kind == .image ? .smallImage : .smallText
     case ..<(10 << 20): .medium
     case ..<(100 << 20): .large
     default: .huge
@@ -18,7 +25,8 @@ enum SizeTier: String, CaseIterable, Codable {
 
   var title: String {
     switch self {
-    case .small: "Up to 1 MB"
+    case .smallText: "Text up to 1 MB"
+    case .smallImage: "Images up to 1 MB"
     case .medium: "1 to 10 MB"
     case .large: "10 to 100 MB"
     case .huge: "Over 100 MB"
@@ -27,7 +35,8 @@ enum SizeTier: String, CaseIterable, Codable {
 
   var defaultDays: Int {
     switch self {
-    case .small: 365
+    case .smallText: 365
+    case .smallImage: 30
     case .medium: 30
     case .large: 14
     case .huge: 3
@@ -35,12 +44,16 @@ enum SizeTier: String, CaseIterable, Codable {
   }
 
   /// Band as stored in items.band and totals.band
+  ///
+  /// smallImage is 4 because the other four were already written to the
+  /// database before it existed
   var band: Int {
     switch self {
-    case .small: 0
+    case .smallText: 0
     case .medium: 1
     case .large: 2
     case .huge: 3
+    case .smallImage: 4
     }
   }
 

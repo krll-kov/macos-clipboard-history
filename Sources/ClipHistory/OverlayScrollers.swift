@@ -57,6 +57,7 @@ struct ScrollerStyle: NSViewRepresentable {
       if alwaysVisible {
         measure(scroll)
         watch(scroll, coordinator)
+        ListScroll.shared.view = scroll
       }
       found = true
     }
@@ -107,6 +108,27 @@ struct ScrollerStyle: NSViewRepresentable {
 final class ListInset: ObservableObject {
   static let shared = ListInset()
   @Published var overhang: CGFloat = 0
+}
+
+/// The history list's scroll view, for offsets SwiftUI cannot express
+@MainActor
+final class ListScroll {
+  static let shared = ListScroll()
+  weak var view: NSScrollView?
+
+  var offset: CGFloat { view?.contentView.bounds.origin.y ?? 0 }
+
+  /// Height of one row plus the gap under it, from the laid out content
+  func slot(rows: Int, padding: CGFloat, spacing: CGFloat) -> CGFloat {
+    guard rows > 1, let document = view?.documentView else { return 0 }
+    return (document.frame.height - padding * 2 + spacing) / CGFloat(rows)
+  }
+
+  func scroll(to y: CGFloat) {
+    guard let view else { return }
+    view.contentView.scroll(to: NSPoint(x: 0, y: y))
+    view.reflectScrolledClipView(view.contentView)
+  }
 }
 
 enum ScrollerMetrics {

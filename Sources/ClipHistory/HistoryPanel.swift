@@ -11,6 +11,11 @@ final class HistoryPanel {
   }
   var onSettings: (() -> Void)?
 
+  /// App that was frontmost when the panel opened, to hand focus back to
+  private var previousApp: NSRunningApplication?
+  /// resignKey arrives while the closing animation runs and would start it again
+  private var hiding = false
+
   var isVisible: Bool { panel?.isVisible ?? false }
 
   func toggle() {
@@ -19,6 +24,11 @@ final class HistoryPanel {
 
   func show(filter: SizeTier? = nil) {
     tier = filter
+    hiding = false
+    let front = NSWorkspace.shared.frontmostApplication
+    previousApp = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+      ? nil
+      : front
     // The list should already obey the limits, whether or not anything was
     // copied since they last changed
     ClipboardStore.shared.applyLimits()
@@ -61,14 +71,31 @@ final class HistoryPanel {
   }
 
   func hide() {
-    guard let panel, panel.isVisible else { return }
+    guard let panel, panel.isVisible, !hiding else { return }
+    hiding = true
     NSAnimationContext.runAnimationGroup { context in
       context.duration = 0.12
       context.timingFunction = CAMediaTimingFunction(name: .easeIn)
       panel.animator().alphaValue = 0
-    } completionHandler: {
-      panel.orderOut(nil)
+    } completionHandler: { [weak self] in
+      MainActor.assumeIsolated {
+        guard let self, self.hiding else { return }
+        self.hiding = false
+        panel.orderOut(nil)
+        self.restoreFocus()
+      }
     }
+  }
+
+  /// Ordering out a non-activating panel leaves the app behind it frontmost
+  /// with nothing focused to paste into
+  private func restoreFocus() {
+    guard let app = previousApp, !app.isTerminated else { return }
+    previousApp = nil
+    // Anything else in front, the settings window included, keeps what it has
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard front == nil || front == app.processIdentifier else { return }
+    app.activate()
   }
 
   private func makePanel() -> NSPanel {
@@ -95,6 +122,8 @@ final class HistoryPanel {
       },
       onClose: { [weak self] in self?.hide() },
       onSettings: { [weak self] in
+        // The settings window is what should end up in front now
+        self?.previousApp = nil
         self?.hide()
         self?.onSettings?()
       },

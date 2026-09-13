@@ -26,6 +26,9 @@ final class PasteboardWatcher {
     guard pasteboard.changeCount != changeCount else { return }
     changeCount = pasteboard.changeCount
     guard pasteboard.string(forType: .init("org.nspasteboard.ConcealedType")) == nil else { return }
+    // A copy made from the panel is already in the history and stays where it
+    // is: reordering the list under an open panel loses the scroll position
+    guard pasteboard.string(forType: ClipboardStore.ownerType) == nil else { return }
 
     let source = currentSource()
     if let text = pasteboard.string(forType: .string) {
@@ -53,11 +56,8 @@ final class PasteboardWatcher {
     }
   }
 
-  /// Where the copy came from
-  ///
   /// A screen capture announces itself on the pasteboard, anything else is
-  /// credited to the frontmost app. The panel never activates, so it is never
-  /// credited itself
+  /// credited to the frontmost app
   private func currentSource() -> String? {
     if pasteboard.types?.contains(where: { $0.rawValue.contains("screencapture") }) == true {
       return "Screenshot"

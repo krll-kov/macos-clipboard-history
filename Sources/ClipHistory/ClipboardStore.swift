@@ -16,7 +16,7 @@ struct ClipItem: Identifiable, Codable, Equatable {
   /// App that was frontmost when this was copied, or "Screenshot"
   let source: String?
 
-  var tier: SizeTier { .of(bytes: bytes) }
+  var tier: SizeTier { .of(bytes: bytes, kind: kind) }
 
   static func == (a: ClipItem, b: ClipItem) -> Bool { a.id == b.id }
 }
@@ -30,13 +30,11 @@ struct ClipItem: Identifiable, Codable, Equatable {
 final class ClipboardStore: ObservableObject {
   static let shared = ClipboardStore()
   nonisolated static let previewLimit = 400
-  /// Rows per query, built into ClipItems on every keystroke
   nonisolated static let pageLimit = 300
 
   /// Bumped on every change; the list redraws from it
   @Published private(set) var generation = 0
 
-  /// Set while a bulk delete runs
   @Published private(set) var bulk: Bulk?
 
   struct Bulk: Equatable {
@@ -142,6 +140,30 @@ final class ClipboardStore: ObservableObject {
         UPDATE totals SET count = count - 1, bytes = bytes - old.bytes WHERE band = old.band;
       END
       """)
+    migrate()
+  }
+
+  /// Moves images under 1 MB out of the text band they used to share
+  ///
+  /// UPDATE fires neither trigger, so both totals are counted again afterwards
+  private func migrate() {
+    let version = database.first("PRAGMA user_version") { $0.int(0) } ?? 0
+    guard version < 1 else { return }
+    database.transaction {
+      database.perform("UPDATE items SET band = ? WHERE band = ? AND kind = 'image'",
+                       [.int(SizeTier.smallImage.band), .int(SizeTier.smallText.band)])
+      for tier in [SizeTier.smallText, .smallImage] { recount(tier) }
+    }
+    database.run("PRAGMA user_version=1")
+  }
+
+  private func recount(_ tier: SizeTier) {
+    database.perform("""
+      UPDATE totals SET
+        count = (SELECT count(*) FROM items WHERE band = ?1),
+        bytes = (SELECT coalesce(sum(bytes), 0) FROM items WHERE band = ?1)
+      WHERE band = ?1
+      """, [.int(tier.band)])
   }
 
   /// Search indexes in ranking order
@@ -246,7 +268,6 @@ final class ClipboardStore: ObservableObject {
     return found + deep
   }
 
-  /// First 16 KB of a stored body
   private func head(of item: ClipItem, bytes: Int = 16 << 10) -> String {
     guard item.kind == .text, let url = fileURL(for: item),
           let handle = try? FileHandle(forReadingFrom: url)
@@ -277,8 +298,6 @@ final class ClipboardStore: ObservableObject {
     return rows
   }
 
-  // MARK: - Bodies
-
   func fileURL(for item: ClipItem) -> URL? {
     item.file.map { bodies.appendingPathComponent($0) }
   }
@@ -294,17 +313,27 @@ final class ClipboardStore: ObservableObject {
     return text
   }
 
-  func copyToPasteboard(_ item: ClipItem) {
-    let pb = NSPasteboard.general
-    pb.clearContents()
+  /// Marks a copy the app made itself, carrying the id of the entry it came from
+  nonisolated static let ownerType = NSPasteboard.PasteboardType("dev.swiftsoft.cliphistory.entry")
+
+  func copyToPasteboard(_ item: ClipItem, to pasteboard: NSPasteboard = .general) {
+    let entry = NSPasteboardItem()
     switch item.kind {
     case .text:
-      pb.setString(fullText(of: item), forType: .string)
+      entry.setString(fullText(of: item), forType: .string)
     case .image:
-      if let url = fileURL(for: item), let image = NSImage(contentsOf: url) {
-        pb.writeObjects([image])
+      guard let url = fileURL(for: item), let data = try? Data(contentsOf: url) else { return }
+      entry.setData(data, forType: .png)
+      // Apps that read only TIFF, which is what NSImage used to put here
+      if let tiff = NSImage(data: data)?.tiffRepresentation {
+        entry.setData(tiff, forType: .tiff)
       }
     }
+    entry.setString(item.id.uuidString, forType: Self.ownerType)
+    pasteboard.clearContents()
+    pasteboard.writeObjects([entry])
+    // Not from the watcher, which sees the copy up to 0.4 s later
+    touch(id: item.id)
   }
 
   // MARK: - Storing
@@ -342,13 +371,26 @@ final class ClipboardStore: ObservableObject {
   }
 
   /// Re-copying an entry moves it back to the top instead of storing it twice
-  ///
-  /// Delete and insert rather than UPDATE date: search orders by rowid, so
-  /// recency has to be in rowid order too
   private func bump(_ digest: String) -> Bool {
     guard let old = database.first(
       "SELECT \(Self.columns) FROM items WHERE digest = ?", [.text(digest)],
       { Self.item(from: $0) }) else { return false }
+    promote(old)
+    return true
+  }
+
+  /// Same for an entry copied out of the panel, which the watcher skips
+  private func touch(id: UUID) {
+    guard let old = database.first(
+      "SELECT \(Self.columns) FROM items WHERE id = ?", [.text(id.uuidString)],
+      { Self.item(from: $0) }) else { return }
+    promote(old)
+  }
+
+  /// Delete and insert rather than UPDATE date: search orders by rowid, so
+  /// recency has to be in rowid order too. Everything else is carried over,
+  /// including the source it was first copied from
+  private func promote(_ old: ClipItem) {
     database.transaction {
       database.perform("DELETE FROM items WHERE id = ?", [.text(old.id.uuidString)])
       write(ClipItem(id: old.id, kind: old.kind, date: Date(), bytes: old.bytes,
@@ -356,7 +398,6 @@ final class ClipboardStore: ObservableObject {
                      thumb: old.thumb, source: old.source))
     }
     generation += 1
-    return true
   }
 
   private func insert(_ item: ClipItem) {
@@ -409,8 +450,6 @@ final class ClipboardStore: ObservableObject {
                      """, [.int(tier.band)])
   }
 
-  /// Deletes in batches, yielding between them
-  ///
   /// One statement over 90 000 entries holds the main thread for minutes
   private func bulkDelete(_ title: String, total: Int, _ sql: String,
                           _ values: [Database.Value] = []) async {
@@ -434,8 +473,6 @@ final class ClipboardStore: ObservableObject {
 
   private static let deleteBatch = 2000
 
-  /// Applies retention, maxItems and maxTotalBytes
-  ///
   /// Called on every copy, every 600 s, on .clipLimitsChanged, when the settings
   /// close and when the panel opens: a limit lowered in the settings and a day
   /// passing have nothing else to hang off
@@ -500,8 +537,6 @@ final class ClipboardStore: ObservableObject {
     generation += 1
   }
 
-  /// Deletes rows with the bodies they name and returns how many went
-  ///
   /// The names come back from the delete itself, so nothing has to be read
   /// first
   @discardableResult
@@ -523,8 +558,6 @@ final class ClipboardStore: ObservableObject {
     return gone
   }
 
-  /// Returns freed pages to the file system, 2000 at a time
-  ///
   /// 683 MB back to 40 MB after a million rows; in one call that is seconds of
   /// held main thread
   private func reclaim() async {
@@ -548,7 +581,6 @@ final class ClipboardStore: ObservableObject {
     database.first("PRAGMA freelist_count") { $0.int(0) } ?? 0
   }
 
-  /// Allocated size of the whole store folder
   func diskBytes() -> Int {
     let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
     guard let files = FileManager.default.enumerator(
@@ -561,7 +593,6 @@ final class ClipboardStore: ObservableObject {
     return total
   }
 
-  /// Folds the write-ahead log into the database file, for shutdown
   func flush() {
     database.run("PRAGMA wal_checkpoint(TRUNCATE)")
   }

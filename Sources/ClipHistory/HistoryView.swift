@@ -79,7 +79,7 @@ struct HistoryView: View {
         .textFieldStyle(.plain)
         .font(.system(size: 15))
         .focused($searchFocused)
-        .onSubmit { if let item = current { onPick(item) } }
+        .onSubmit { if let item = current { pick(item) } }
         .onChange(of: query) { _, _ in selection = results.first?.id }
         .onKeyPress(.downArrow) { keyboardActive = true; move(1); return .handled }
         .onKeyPress(.upArrow) { keyboardActive = true; move(-1); return .handled }
@@ -130,10 +130,26 @@ struct HistoryView: View {
     .help(help)
   }
 
+  private static let rowGap: CGFloat = 6
+  private static let listPadding: CGFloat = 8
+
+  /// Copies, leaving the rows on screen where they are
+  ///
+  /// The entry moves to the top of the history, which slides everything above
+  /// its old place down by one row, so the offset moves by the same row
+  private func pick(_ item: ClipItem) {
+    let offset = ListScroll.shared.offset
+    let slides = offset > 0.5 && results.first?.id != item.id
+    let slot = ListScroll.shared.slot(rows: results.count, padding: Self.listPadding,
+                                      spacing: Self.rowGap)
+    onPick(item)
+    if slides { ListScroll.shared.scroll(to: offset + slot) }
+  }
+
   private var list: some View {
     ScrollViewReader { proxy in
       ScrollView {
-        LazyVStack(spacing: 6) {
+        LazyVStack(spacing: Self.rowGap) {
           ForEach(results) { item in
             row(item)
               .id(item.id)
@@ -143,7 +159,7 @@ struct HistoryView: View {
               .animation(.easeOut(duration: 0.12), value: pressed)
               .onTapGesture {
                 selection = item.id
-                onPick(item)
+                pick(item)
               }
               .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
@@ -159,27 +175,28 @@ struct HistoryView: View {
                 }
               }
               .contextMenu {
-                Button("Copy") { onPick(item) }
+                Button("Copy") { pick(item) }
                 Button("Delete") { store.remove(item) }
               }
           }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, Self.listPadding)
         // 15 pt the scroller took but SwiftUI did not account for, so a card
         // ends on the same edge whether the list scrolls or not
         .padding(.trailing, inset.overhang)
       }
       .visibleScrollers()
-      // Animated only for the arrow keys: when the selection moved because a
-      // new search replaced the list, there is nothing to slide from
+      // Only the arrow keys scroll to the selection: a click selects a row that
+      // is on screen already, and dragging it to the top was the jump on copy
       .onChange(of: selection) { _, id in
-        guard let id else { return }
-        if keyboardActive {
-          withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id) }
-        } else {
-          proxy.scrollTo(id, anchor: .top)
-        }
+        guard keyboardActive, let id else { return }
+        withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id) }
+      }
+      // A new search shows its results from the first one
+      .onChange(of: query) { _, _ in
+        guard let top = results.first?.id else { return }
+        proxy.scrollTo(top, anchor: .top)
       }
     }
   }
@@ -250,6 +267,21 @@ struct HistoryView: View {
           RoundedRectangle(cornerRadius: 5, style: .continuous)
             .strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.5)
         )
+        .overlay(alignment: .bottomTrailing) { badge(item) }
+    }
+  }
+
+  /// The source app on the corner of a text icon, where the row has no other
+  /// room for it: the subtitle carries it only for pictures
+  @ViewBuilder
+  private func badge(_ item: ClipItem) -> some View {
+    if item.kind == .text, let icon = SourceIcon.image(for: item.source) {
+      Image(nsImage: icon)
+        .resizable()
+        .frame(width: 15, height: 15)
+        .padding(1.5)
+        .background(Color(nsColor: .windowBackgroundColor).opacity(0.9), in: Circle())
+        .offset(x: 4, y: 4)
     }
   }
 

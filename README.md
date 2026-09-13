@@ -100,10 +100,13 @@ Search covers the whole history, including entries older than the quick list sho
 
 | Band | Default retention |
 |---|---|
-| Up to 1 MB | 1 year |
+| Text up to 1 MB | 1 year |
+| Images up to 1 MB | 1 month |
 | 1 to 10 MB | 1 month |
 | 10 to 100 MB | 2 weeks |
 | Over 100 MB | 3 days |
+
+Under 1 MB text and images are separate bands, so a year of copied lines can be kept while small screenshots expire in a month.
 
 **Show** opens the panel filtered to one band, **Clear** empties that band alone.
 
@@ -162,7 +165,7 @@ defaults write dev.swiftsoft.cliphistory closeAfterPick -bool false
 defaults write dev.swiftsoft.cliphistory retentionDays.huge -int 1
 ```
 
-`memoryDays` and every `retentionDays.*` accept `0` for forever. The bands are `small`, `medium`, `large` and `huge`.
+`memoryDays` and every `retentionDays.*` accept `0` for forever. The bands are `small` (text under 1 MB), `smallImage`, `medium`, `large` and `huge`.
 
 ### Uninstalling
 
