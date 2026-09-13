@@ -114,7 +114,7 @@ Under 1 MB text and images are separate bands, so a year of copied lines can be 
 
 <sup>Hard limits, shortcut, appearance and storage. `Everything · 90005 items · 18,11 GB`, and the counters under each size band are read instantly at that size.</sup>
 
-**Hard limits** cap the number of entries and the total size, oldest dropped first. Defaults are 1 000 000 entries and 20 GB, and the cap goes up to 5 000 000. **Skip items larger than** refuses to capture anything above that size at all, so a copied video never enters the history.
+**Hard limits** cap the number of entries and the total size. When one is reached, entries that have lived past 85% of their band's retention go first, the closest to expiring first, so a screenshot two and a half days into its three is dropped before text kept for a year. If those are not enough, the oldest entries go, whatever their band, Forever included. A fresh screenshot in a history full of Forever text is therefore kept, and the oldest text makes room for it. Defaults are 1 000 000 entries and 20 GB, and the cap goes up to 5 000 000. **Skip items larger than** refuses to capture anything above that size at all, so a copied video never enters the history.
 
 **Shortcut** records a new hot key when you press one.
 
@@ -196,7 +196,7 @@ The list only reaches back as far as **Show entries from** in settings. Everythi
 
 ### Where did an entry go?
 
-Either its size band reached its retention, or a hard limit dropped it as the oldest entry. Both are in settings; the size bands in **Keep by size** show how much each is holding.
+Either its size band reached its retention, or a hard limit dropped it: first entries close to their own retention, then the oldest. Both are in settings; the size bands in **Keep by size** show how much each is holding.
 
 ### Does it survive a restart of the app?
 
@@ -218,6 +218,7 @@ Metadata is in SQLite, bodies are plain files beside it. A 100 MB image never pa
 | 300 decoded thumbnails cached, encoding off the main thread | Scrolling never waits on the disk or on the encoder |
 | 300 rows per query, answers cached per keystroke | The list is rebuilt once per redraw, not several times |
 | `auto_vacuum=INCREMENTAL` | 683 MB back to 40 MB in 1.9 s after a large deletion |
+| Hard limits merge the oldest entries of each band, read from items_band | Reaching the size limit costs 0.9 ms per copy instead of 1.6 s at a million rows |
 | SHA-256 deduplication | Re-copying moves an entry to the top instead of storing it twice |
 
 ### Measured

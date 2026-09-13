@@ -51,7 +51,6 @@ final class ClipboardStore: ObservableObject {
   private var deletedSinceVacuum = 0
   /// Unlinking 90 000 bodies takes longer than deleting their rows
   private let unlink = DispatchQueue(label: "dev.swiftsoft.cliphistory.unlink", qos: .utility)
-  /// Last answer given to the list, so redrawing does not repeat the query
   private var lastQuery: (key: String, generation: Int, rows: [ClipItem])?
 
   private init() {
@@ -64,8 +63,7 @@ final class ClipboardStore: ObservableObject {
     do {
       database = try Database(path: file.path)
     } catch {
-      // No database means no history, and a menu bar app has nowhere to show
-      // the failure
+      // A menu bar app has nowhere to show the failure
       NSLog("clipboard history: \(error)")
       fatalError("cannot open \(file.path): \(error)")
     }
@@ -143,9 +141,8 @@ final class ClipboardStore: ObservableObject {
     migrate()
   }
 
-  /// Moves images under 1 MB out of the text band they used to share
-  ///
-  /// UPDATE fires neither trigger, so both totals are counted again afterwards
+  /// Moves images under 1 MB out of the text band; UPDATE fires neither trigger,
+  /// so both totals are counted again
   private func migrate() {
     let version = database.first("PRAGMA user_version") { $0.int(0) } ?? 0
     guard version < 1 else { return }
@@ -388,8 +385,7 @@ final class ClipboardStore: ObservableObject {
   }
 
   /// Delete and insert rather than UPDATE date: search orders by rowid, so
-  /// recency has to be in rowid order too. Everything else is carried over,
-  /// including the source it was first copied from
+  /// recency has to be in rowid order too
   private func promote(_ old: ClipItem) {
     database.transaction {
       database.perform("DELETE FROM items WHERE id = ?", [.text(old.id.uuidString)])
@@ -488,25 +484,23 @@ final class ClipboardStore: ObservableObject {
         [.int(tier.band), .double(now - Double(days) * 86400)])
     }
 
-    let extra = count - settings.maxItems
-    if extra > 0 {
-      dropped += dropRows("""
-        DELETE FROM items WHERE rowid IN
-          (SELECT rowid FROM items ORDER BY date ASC LIMIT ?)
-        RETURNING file, thumb, id
-        """, [.int(extra)])
-    }
-
-    if totalBytes > settings.maxTotalBytes {
-      // Running sum over date DESC: everything past the point where the newest
-      // entries have used up the allowance
-      dropped += dropRows("""
-        DELETE FROM items WHERE rowid IN (
-          SELECT rowid FROM (
-            SELECT rowid, sum(bytes) OVER (ORDER BY date DESC) AS running FROM items
-          ) WHERE running > ?
-        ) RETURNING file, thumb, id
-        """, [.int(settings.maxTotalBytes)])
+    // A commit per statement checkpoints the log each time
+    if count > settings.maxItems || totalBytes > settings.maxTotalBytes {
+      database.transaction {
+        while count > settings.maxItems {
+          let gone = evict(min(count - settings.maxItems, Self.evictLimit))
+          guard gone > 0 else { break }
+          dropped += gone
+        }
+        // Usually one entry covers the excess, so the first read is small
+        var window = 32
+        while totalBytes > settings.maxTotalBytes {
+          let gone = evict(window, until: totalBytes - settings.maxTotalBytes)
+          guard gone > 0 else { break }
+          dropped += gone
+          window = min(window * 8, Self.evictLimit)
+        }
+      }
     }
 
     if dropped > 0 {
@@ -518,8 +512,55 @@ final class ClipboardStore: ObservableObject {
     }
   }
 
-  /// Drops entries whose stored body is gone
-  ///
+  /// Deletes up to `limit` entries: those past 85% of their band's retention
+  /// first, soonest to expire first, then the rest oldest first whatever the band.
+  /// With `bytes`, stops at the one that frees that much. Expiry alone deleted a
+  /// fresh screenshot on arrival in a history full of Forever text
+  private func evict(_ limit: Int, until bytes: Int? = nil) -> Int {
+    let now = Date().timeIntervalSince1970
+    var values: [Database.Value] = []
+    for tier in SizeTier.allCases {
+      let life = Double(Settings.shared.retention(for: tier)) * 86400
+      let cutoff = life > 0 ? now - life * Self.nearlyExpired : -1
+      values += [.double(cutoff), .double(life), .int(tier.band), .int(limit)]
+    }
+    values.append(.int(limit))
+    guard let bytes else {
+      // items_band alone: reading bytes too cost 1954 ms instead of 122 at 100 000
+      return dropRows("""
+        DELETE FROM items WHERE rowid IN (
+          SELECT id FROM (\(Self.heads(""))) ORDER BY expiry, date LIMIT ?
+        ) RETURNING file, thumb, id
+        """, values)
+    }
+    return dropRows("""
+      DELETE FROM items WHERE rowid IN (
+        SELECT id FROM (
+          SELECT id, sum(bytes) OVER (ORDER BY expiry, date ROWS UNBOUNDED PRECEDING)
+                     - bytes AS before
+          FROM (\(Self.heads("bytes,")) ORDER BY expiry, date LIMIT ?)
+        ) WHERE before < ?
+      ) RETURNING file, thumb, id
+      """, values + [.int(bytes)])
+  }
+
+  /// Both keys grow with the date inside a band, so a band's oldest entries, read
+  /// off items_band, are all the merge needs. 1e12 puts the rest after the nearly
+  /// expired, in date order
+  private static func heads(_ extra: String) -> String {
+    SizeTier.allCases.map { _ in """
+      SELECT * FROM (SELECT rowid AS id, \(extra)
+                       CASE WHEN date <= ? THEN date + ? ELSE 1e12 + date END AS expiry, date
+                     FROM items WHERE band = ? ORDER BY date LIMIT ?)
+      """ }.joined(separator: " UNION ALL ")
+  }
+
+  private static let nearlyExpired = 0.85
+
+  /// Per statement: one reads the pages it deletes from once, in rowid order;
+  /// batches of 2000 read them again and again, 4.6 s against 2.2 s at 100 000
+  private static let evictLimit = 100_000
+
   /// Rows and files fall out of step if the process dies between the two writes.
   /// Bounded to the newest 1000, since this runs at every launch
   private func dropOrphans() {
