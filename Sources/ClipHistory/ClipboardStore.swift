@@ -21,6 +21,113 @@ struct ClipItem: Identifiable, Codable, Equatable {
   static func == (a: ClipItem, b: ClipItem) -> Bool { a.id == b.id }
 }
 
+/// A band, or the whole history, deleted on the bulk connection
+private final class BulkDelete: @unchecked Sendable {
+  let database: Database
+  let bodies: URL
+  let unlink: DispatchQueue
+  let band: Int?
+  /// More rows go than stay
+  let rebuild: Bool
+
+  init(database: Database, bodies: URL, unlink: DispatchQueue, band: Int?, rebuild: Bool) {
+    self.database = database
+    self.bodies = bodies
+    self.unlink = unlink
+    self.band = band
+    self.rebuild = rebuild
+  }
+
+  func run(progress: (Int) -> Void) {
+    if rebuild { refill(progress) } else { rowByRow(progress) }
+  }
+
+  /// The trigger clears the search indexes for each deleted row
+  private func rowByRow(_ progress: (Int) -> Void) {
+    var done = 0
+    while true {
+      let gone = delete(ClipboardStore.deleteBatch)
+      guard gone > 0 else { break }
+      done += gone
+      progress(done)
+    }
+  }
+
+  /// Empties the search indexes, deletes the rows and indexes the rows that stay
+  ///
+  /// One transaction, so a crash rolls all of it back. The log grew to 332 MB for
+  /// a clear of 891 933 texts
+  private func refill(_ progress: (Int) -> Void) {
+    let indexes = ClipboardStore.indexes + ["search_words"]
+    database.transaction {
+      // The full trigger would delete each row from indexes we empty anyway
+      database.run("DROP TRIGGER items_gone")
+      database.run("""
+        CREATE TRIGGER items_gone AFTER DELETE ON items BEGIN
+          UPDATE totals SET count = count - 1, bytes = bytes - old.bytes WHERE band = old.band;
+        END
+        """)
+      for index in indexes {
+        database.run("INSERT INTO \(index)(\(index)) VALUES('delete-all')")
+      }
+      var done = 0
+      while true {
+        let gone = delete(20_000)
+        guard gone > 0 else { break }
+        done += gone
+        progress(done)
+      }
+      var kept: [(rowid: Int, kind: String, date: Double, bytes: Int, preview: String,
+                  file: String?, source: String?)] = []
+      database.each("SELECT rowid, kind, date, bytes, preview, file, source FROM items") {
+        kept.append(($0.int(0), $0.text(1), $0.double(2), $0.int(3), $0.text(4),
+                     $0.optionalText(5), $0.optionalText(6)))
+      }
+      let rows = kept
+      let folder = bodies
+      ClipboardStore.inChunks(rows.count, key: { i in
+        let row = rows[i]
+        var keys = ClipboardStore.keys(preview: row.preview, source: row.source, bytes: row.bytes,
+                                       date: Date(timeIntervalSince1970: row.date))
+        if row.kind == ClipItem.Kind.text.rawValue {
+          let body = ClipboardStore.head(of: row.file.map { folder.appendingPathComponent($0) },
+                                         preview: row.preview, bytes: ClipboardStore.searchLimit)
+          keys.append(ClipboardStore.loose(body))
+        }
+        return keys
+      }) { i, keys in
+        for (index, key) in zip(indexes, keys) {
+          database.perform("INSERT INTO \(index)(rowid, text) VALUES (?,?)",
+                           [.int(rows[i].rowid), .text(key)])
+        }
+      }
+      database.run("DROP TRIGGER items_gone")
+      database.run(ClipboardStore.goneTrigger)
+    }
+  }
+
+  /// Deletes up to `limit` rows and hands their files to the unlink queue
+  private func delete(_ limit: Int) -> Int {
+    var files: [String] = []
+    var gone = 0
+    let filter = band == nil ? "" : "WHERE band = ?"
+    let values: [Database.Value] = (band.map { [.int($0)] } ?? []) + [.int(limit)]
+    database.each("""
+      DELETE FROM items WHERE rowid IN (SELECT rowid FROM items \(filter) LIMIT ?)
+      RETURNING file, thumb
+      """, values) { row in
+      gone += 1
+      if let file = row.optionalText(0) { files.append(file) }
+      if let thumb = row.optionalText(1) { files.append(thumb) }
+    }
+    let folder = bodies
+    unlink.async {
+      for name in files { try? FileManager.default.removeItem(at: folder.appendingPathComponent(name)) }
+    }
+    return gone
+  }
+}
+
 /// The history, held in SQLite
 ///
 /// Every list and every count is a query, so nothing is kept in memory and a
@@ -47,6 +154,12 @@ final class ClipboardStore: ObservableObject {
   private let root: URL
   private let bodies: URL
   private let database: Database
+  /// Bulk deletes run on their own connection and queue. On the main thread a
+  /// clear of 891 933 texts held it for 15 s a batch
+  private let bulkDatabase: Database
+  private let bulkQueue = DispatchQueue(label: "dev.swiftsoft.cliphistory.bulk", qos: .userInitiated)
+  /// Copies that arrive during a bulk delete. We store them when it ends
+  private var deferred: [() -> Void] = []
   private var pruneTimer: Timer?
   private var deletedSinceVacuum = 0
   /// Unlinking 90 000 bodies takes longer than deleting their rows
@@ -62,12 +175,15 @@ final class ClipboardStore: ObservableObject {
     let file = root.appendingPathComponent("history.db")
     do {
       database = try Database(path: file.path)
+      bulkDatabase = try Database(path: file.path)
     } catch {
       // A menu bar app has nowhere to show the failure
       NSLog("clipboard history: \(error)")
       fatalError("cannot open \(file.path): \(error)")
     }
     prepare()
+    bulkDatabase.run("PRAGMA synchronous=NORMAL")
+    bulkDatabase.run("PRAGMA temp_store=MEMORY")
     dropOrphans()
     applyLimits()
 
@@ -135,7 +251,7 @@ final class ClipboardStore: ObservableObject {
     migrate()
   }
 
-  private static let goneTrigger = """
+  nonisolated fileprivate static let goneTrigger = """
     CREATE TRIGGER IF NOT EXISTS items_gone AFTER DELETE ON items BEGIN
       DELETE FROM search_text WHERE rowid = old.rowid;
       DELETE FROM search_words WHERE rowid = old.rowid;
@@ -217,7 +333,7 @@ final class ClipboardStore: ObservableObject {
   }
 
   /// Search indexes in ranking order
-  private static let indexes = ["search_text", "search_source", "search_meta"]
+  nonisolated fileprivate static let indexes = ["search_text", "search_source", "search_meta"]
 
   // MARK: - What the list asks for
 
@@ -333,17 +449,17 @@ final class ClipboardStore: ObservableObject {
 
   /// Builds keys on every core and hands them to `insert` in order, 20 000 at a
   /// time, so the keys of a million entries are never held at once
-  private nonisolated static func inChunks(_ count: Int, key: @escaping @Sendable (Int) -> String,
-                                           insert: (Int, String) -> Void) {
+  fileprivate nonisolated static func inChunks<Key>(_ count: Int, key: @escaping @Sendable (Int) -> Key,
+                                                    insert: (Int, Key) -> Void) {
     for lower in stride(from: 0, to: count, by: 20_000) {
       let upper = min(lower + 20_000, count)
-      var keys = [String](repeating: "", count: upper - lower)
+      var keys = [Key?](repeating: nil, count: upper - lower)
       keys.withUnsafeMutableBufferPointer { buffer in
         // Each iteration writes only its own slot
         nonisolated(unsafe) let base = buffer.baseAddress!
         DispatchQueue.concurrentPerform(iterations: upper - lower) { base[$0] = key(lower + $0) }
       }
-      for (offset, key) in keys.enumerated() { insert(lower + offset, key) }
+      for (offset, key) in keys.enumerated() { insert(lower + offset, key!) }
     }
   }
 
@@ -351,7 +467,7 @@ final class ClipboardStore: ObservableObject {
     Self.head(of: file.map { bodies.appendingPathComponent($0) }, preview: preview, bytes: bytes)
   }
 
-  private nonisolated static func head(of url: URL?, preview: String, bytes: Int) -> String {
+  fileprivate nonisolated static func head(of url: URL?, preview: String, bytes: Int) -> String {
     guard let url, let handle = try? FileHandle(forReadingFrom: url) else { return preview }
     defer { try? handle.close() }
     guard let data = try? handle.read(upToCount: bytes) else { return preview }
@@ -425,6 +541,10 @@ final class ClipboardStore: ObservableObject {
   // MARK: - Storing
 
   func add(text: String, source: String?) {
+    guard bulk == nil else {
+      deferred.append { [weak self] in self?.add(text: text, source: source) }
+      return
+    }
     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
     let data = Data(text.utf8)
     guard data.count <= Settings.shared.maxItemBytes else { return }
@@ -442,6 +562,10 @@ final class ClipboardStore: ObservableObject {
   }
 
   func add(png: Data, thumb: Data?, label: String, source: String?) {
+    guard bulk == nil else {
+      deferred.append { [weak self] in self?.add(png: png, thumb: thumb, label: label, source: source) }
+      return
+    }
     guard png.count <= Settings.shared.maxItemBytes else { return }
     let digest = Self.digest(png)
     if bump(digest, source: source) { return }
@@ -471,6 +595,10 @@ final class ClipboardStore: ObservableObject {
 
   /// Same for an entry copied out of the panel, which the watcher skips
   private func touch(id: UUID) {
+    guard bulk == nil else {
+      deferred.append { [weak self] in self?.touch(id: id) }
+      return
+    }
     guard let old = database.first(
       "SELECT \(Self.columns) FROM items WHERE id = ?", [.text(id.uuidString)],
       { Self.item(from: $0) }) else { return }
@@ -511,11 +639,7 @@ final class ClipboardStore: ObservableObject {
       ])
     guard let rowid = database.first("SELECT rowid FROM items WHERE id = ?",
                                      [.text(item.id.uuidString)], { $0.int(0) }) else { return }
-    let keys = [
-      Self.loose(item.preview),
-      Self.loose(item.source ?? ""),
-      Self.loose(Self.sizeKeys(item.bytes) + " " + Self.dateKeys(item.date)),
-    ]
+    let keys = Self.keys(preview: item.preview, source: item.source, bytes: item.bytes, date: item.date)
     for (index, key) in zip(Self.indexes, keys) {
       database.perform("INSERT INTO \(index)(rowid, text) VALUES (?,?)", [.int(rowid), .text(key)])
     }
@@ -528,50 +652,61 @@ final class ClipboardStore: ObservableObject {
   // MARK: - Removing
 
   func remove(_ item: ClipItem) {
+    guard bulk == nil else { return }
     dropRows("DELETE FROM items WHERE id = ? RETURNING file, thumb, id", [.text(item.id.uuidString)])
     generation += 1
   }
 
   func removeAll() async {
-    await bulkDelete("Clearing history", total: count,
-                     "DELETE FROM items WHERE rowid IN (SELECT rowid FROM items LIMIT ?)")
+    await bulkDelete("Clearing history", band: nil, total: count)
   }
 
   func removeAll(in tier: SizeTier) async {
-    await bulkDelete("Clearing \(tier.title)", total: count(in: tier),
-                     """
-                     DELETE FROM items WHERE rowid IN
-                       (SELECT rowid FROM items WHERE band = ? LIMIT ?)
-                     """, [.int(tier.band)])
+    await bulkDelete("Clearing \(tier.title)", band: tier.band, total: count(in: tier))
   }
 
   /// One statement over 90 000 entries holds the main thread for minutes
-  private func bulkDelete(_ title: String, total: Int, _ sql: String,
-                          _ values: [Database.Value] = []) async {
-    guard total > 0 else { return }
+  ///
+  /// The work runs on bulkQueue with its own connection. Row by row on the main
+  /// thread, a clear of 891 933 texts took 15 s a batch of 2000 halfway through.
+  /// When more rows go than stay, BulkDelete empties the search indexes and
+  /// refills them for the rows that stay. That clear took 15.9 s
+  private func bulkDelete(_ title: String, band: Int?, total: Int) async {
+    guard total > 0, bulk == nil else { return }
     bulk = Bulk(title: title, done: 0, total: total)
-    defer { bulk = nil }
-
-    let statement = sql + " RETURNING file, thumb, id"
-    var done = 0
-    while true {
-      let gone = dropRows(statement, values + [.int(Self.deleteBatch)])
-      guard gone > 0 else { break }
-      done += gone
-      bulk?.done = min(done, total)
-      generation += 1
-      await Task.yield()
-      try? await Task.sleep(nanoseconds: 1_000_000)
+    let job = BulkDelete(database: bulkDatabase, bodies: bodies, unlink: unlink, band: band,
+                         rebuild: total > count - total)
+    let queue = bulkQueue
+    await withCheckedContinuation { (finished: CheckedContinuation<Void, Never>) in
+      queue.async { [weak self] in
+        job.run { done in
+          DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+              self?.bulk?.done = min(done, total)
+              self?.generation += 1
+            }
+          }
+        }
+        finished.resume()
+      }
     }
-    await reclaim()
+    ThumbnailCache.shared.removeAll()
+    bulk = nil
+    generation += 1
+    let waiting = deferred
+    deferred.removeAll()
+    for store in waiting { store() }
+    reclaim()
   }
 
-  private static let deleteBatch = 2000
+  nonisolated fileprivate static let deleteBatch = 2000
 
   /// Called on every copy, every 600 s, on .clipLimitsChanged, when the settings
   /// close and when the panel opens: a limit lowered in the settings and a day
   /// passing have nothing else to hang off
   func applyLimits() {
+    // A bulk delete owns the store. The first call after it applies the limits
+    guard bulk == nil else { return }
     let settings = Settings.shared
     let now = Date().timeIntervalSince1970
     var dropped = 0
@@ -605,7 +740,7 @@ final class ClipboardStore: ObservableObject {
     if dropped > 0 {
       deletedSinceVacuum += dropped
       if deletedSinceVacuum > 5000 {
-        Task { await reclaim() }
+        reclaim()
       }
       generation += 1
     }
@@ -700,25 +835,22 @@ final class ClipboardStore: ObservableObject {
 
   /// 683 MB back to 40 MB after a million rows; in one call that is seconds of
   /// held main thread
-  private func reclaim() async {
+  ///
+  /// It runs on bulkQueue, 2000 pages a step. A step held the write lock for
+  /// 157 ms, at most 312 ms, so a copy in the meantime waits one step and not the
+  /// 28 s the whole run took after a clear of 891 933 texts
+  private func reclaim() {
     deletedSinceVacuum = 0
-    bulk = Bulk(title: "Reclaiming space", done: 0, total: freePages)
-    defer { bulk = nil }
-    let start = freePages
-    while true {
-      let before = freePages
-      guard before > 0 else { break }
-      database.run("PRAGMA incremental_vacuum(2000)")
-      let after = freePages
-      guard after < before else { break }
-      bulk?.done = start - after
-      await Task.yield()
-      try? await Task.sleep(nanoseconds: 1_000_000)
+    let database = bulkDatabase
+    bulkQueue.async {
+      while true {
+        let before = database.first("PRAGMA freelist_count") { $0.int(0) } ?? 0
+        guard before > 0 else { break }
+        database.run("PRAGMA incremental_vacuum(2000)")
+        let after = database.first("PRAGMA freelist_count") { $0.int(0) } ?? 0
+        guard after < before else { break }
+      }
     }
-  }
-
-  private var freePages: Int {
-    database.first("PRAGMA freelist_count") { $0.int(0) } ?? 0
   }
 
   func diskBytes() -> Int {
@@ -775,19 +907,26 @@ final class ClipboardStore: ObservableObject {
     return out
   }
 
+  /// Keys for search_text, search_source and search_meta, in the order of indexes.
+  /// write() and BulkDelete both use it, so a refilled index matches a written one
+  fileprivate nonisolated static func keys(preview: String, source: String?, bytes: Int,
+                                           date: Date) -> [String] {
+    [loose(preview), loose(source ?? ""), loose(sizeKeys(bytes) + " " + dateKeys(date))]
+  }
+
   /// "5,4 MB" as the row shows it, "5,4MB" without the space, and "5400000"
-  private static func sizeKeys(_ bytes: Int) -> String {
+  private nonisolated static func sizeKeys(_ bytes: Int) -> String {
     let shown = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     return "\(shown) \(shown.filter { !$0.isWhitespace }) \(bytes)"
   }
 
-  private static func dateKeys(_ date: Date) -> String {
+  private nonisolated static func dateKeys(_ date: Date) -> String {
     Self.dateKeyFormatters.map { $0.string(from: date) }.joined(separator: " ")
   }
 
   /// Day first, year first, month and day alone, the time, the month by name;
   /// separators do not matter, loose() flattens both sides
-  private static let dateKeyFormatters: [DateFormatter] = [
+  private nonisolated static let dateKeyFormatters: [DateFormatter] = [
     "dd-MM-yyyy", "d-M-yyyy", "yyyy-MM-dd", "ddMMyyyy",
     "dd-MM", "d-M", "ddMM", "MM-yyyy",
     "HH-mm", "H-mm", "HHmm",

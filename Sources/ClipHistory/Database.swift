@@ -5,7 +5,10 @@ import SQLite3
 ///
 /// Statements are cached by their SQL text and finalised in deinit. The same
 /// dozen run on every copy, and preparing one costs more than stepping it
-final class Database {
+///
+/// Each instance is used from one queue at a time: the store's on the main
+/// thread, its bulk connection on the bulk queue
+final class Database: @unchecked Sendable {
   enum Failure: Error {
     case open(String)
     case statement(String)

@@ -68,4 +68,9 @@ final class ThumbnailCache {
     cache[id] = nil
     order.removeAll { $0 == id }
   }
+
+  func removeAll() {
+    cache.removeAll()
+    order.removeAll()
+  }
 }

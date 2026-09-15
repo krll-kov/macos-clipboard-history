@@ -217,6 +217,7 @@ Metadata is in SQLite, bodies are plain files beside it. A 100 MB image never pa
 | 300 decoded thumbnails cached, encoding off the main thread | Scrolling never waits on the disk or on the encoder |
 | 300 rows per query, answers cached per keystroke | The list is rebuilt once per redraw, not several times |
 | `auto_vacuum=INCREMENTAL` | 683 MB back to 40 MB in 1.9 s after a large deletion |
+| Clearing a band on a second connection; when most rows go, the search indexes are emptied and refilled for the rows that stay | 890 956 texts cleared in 14.9 s with no pause of the interface over 10 ms, where row by row took 15 s a batch |
 | Hard limits merge the oldest entries of each band, read from items_band | Reaching the size limit costs 0.9 ms per copy instead of 1.6 s at a million rows |
 | SHA-256 deduplication | Re-copying moves an entry to the top instead of storing it twice |
 
