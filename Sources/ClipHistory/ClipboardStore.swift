@@ -97,12 +97,6 @@ final class ClipboardStore: ObservableObject {
       """)
     database.run("CREATE INDEX IF NOT EXISTS items_date ON items(date DESC)")
     database.run("CREATE INDEX IF NOT EXISTS items_band ON items(band, date DESC)")
-    // Partial index for the deep read in deepen(): without it that query
-    // scanned a million rows and cost 256 ms whenever it matched nothing
-    database.run("""
-      CREATE INDEX IF NOT EXISTS items_long ON items(date DESC)
-      WHERE kind = 'text' AND length(preview) >= \(Self.previewLimit)
-      """)
     // Three tables, not three columns of one: a match has to say which of the
     // three it came from, and columns share one hit list, so a meta query walks
     // every hit of the same word in every preview: 96 ms at a million rows to
@@ -116,6 +110,13 @@ final class ClipboardStore: ObservableObject {
           text, tokenize='trigram', content='', contentless_delete=1)
         """)
     }
+    // Whole words of a text, up to searchLimit. Trigrams over the same text took
+    // 1669 MB of index for 1056 MB of text. Words take 272 MB. A word index does
+    // not match part of a word, so that match comes from the preview alone
+    database.run("""
+      CREATE VIRTUAL TABLE IF NOT EXISTS search_words USING fts5(
+        text, tokenize='unicode61', content='', contentless_delete=1)
+      """)
     database.run("""
       CREATE TABLE IF NOT EXISTS totals (
         band INTEGER PRIMARY KEY, count INTEGER NOT NULL, bytes INTEGER NOT NULL)
@@ -130,28 +131,80 @@ final class ClipboardStore: ObservableObject {
         UPDATE totals SET count = count + 1, bytes = bytes + new.bytes WHERE band = new.band;
       END
       """)
-    database.run("""
-      CREATE TRIGGER IF NOT EXISTS items_gone AFTER DELETE ON items BEGIN
-        DELETE FROM search_text WHERE rowid = old.rowid;
-        DELETE FROM search_source WHERE rowid = old.rowid;
-        DELETE FROM search_meta WHERE rowid = old.rowid;
-        UPDATE totals SET count = count - 1, bytes = bytes - old.bytes WHERE band = old.band;
-      END
-      """)
+    database.run(Self.goneTrigger)
     migrate()
   }
+
+  private static let goneTrigger = """
+    CREATE TRIGGER IF NOT EXISTS items_gone AFTER DELETE ON items BEGIN
+      DELETE FROM search_text WHERE rowid = old.rowid;
+      DELETE FROM search_words WHERE rowid = old.rowid;
+      DELETE FROM search_source WHERE rowid = old.rowid;
+      DELETE FROM search_meta WHERE rowid = old.rowid;
+      UPDATE totals SET count = count - 1, bytes = bytes - old.bytes WHERE band = old.band;
+    END
+    """
 
   /// Moves images under 1 MB out of the text band; UPDATE fires neither trigger,
   /// so both totals are counted again
   private func migrate() {
     let version = database.first("PRAGMA user_version") { $0.int(0) } ?? 0
-    guard version < 1 else { return }
-    database.transaction {
-      database.perform("UPDATE items SET band = ? WHERE band = ? AND kind = 'image'",
-                       [.int(SizeTier.smallImage.band), .int(SizeTier.smallText.band)])
-      for tier in [SizeTier.smallText, .smallImage] { recount(tier) }
+    if version < 1 {
+      database.transaction {
+        database.perform("UPDATE items SET band = ? WHERE band = ? AND kind = 'image'",
+                         [.int(SizeTier.smallImage.band), .int(SizeTier.smallText.band)])
+        for tier in [SizeTier.smallText, .smallImage] { recount(tier) }
+      }
+      database.run("PRAGMA user_version=1")
     }
-    database.run("PRAGMA user_version=1")
+    if version < 3 {
+      indexWords(previewsLost: version == 2)
+      database.run("PRAGMA user_version=3")
+    }
+  }
+
+  /// Fills search_words for every stored text
+  ///
+  /// Search used to index only the 400 character preview. A word past that
+  /// point was found only in the 15 newest long entries. Version 2 put trigrams
+  /// of the whole text into search_text instead. We put previews back there and
+  /// return the freed pages to the file system
+  private func indexWords(previewsLost: Bool) {
+    var collected: [(rowid: Int, kind: String, file: String?, preview: String)] = []
+    database.each("SELECT rowid, kind, file, preview FROM items") {
+      collected.append(($0.int(0), $0.text(1), $0.optionalText(2), $0.text(3)))
+    }
+    let rows = collected
+    let texts = rows.filter { $0.kind == ClipItem.Kind.text.rawValue }
+    let folder = bodies
+    database.transaction {
+      if previewsLost {
+        database.run("DROP TABLE search_text")
+        database.run("""
+          CREATE VIRTUAL TABLE search_text USING fts5(
+            text, tokenize='trigram', content='', contentless_delete=1)
+          """)
+        Self.inChunks(rows.count, key: { Self.loose(rows[$0].preview) }) { i, key in
+          database.perform("INSERT INTO search_text(rowid, text) VALUES (?,?)",
+                           [.int(rows[i].rowid), .text(key)])
+        }
+      }
+      // One file at a time on this thread took 151 s to read and 73 s to
+      // normalise for 891 824 texts
+      Self.inChunks(texts.count, key: { i in
+        Self.loose(Self.head(of: texts[i].file.map { folder.appendingPathComponent($0) },
+                             preview: texts[i].preview, bytes: Self.searchLimit))
+      }) { i, key in
+        database.perform("INSERT INTO search_words(rowid, text) VALUES (?,?)",
+                         [.int(texts[i].rowid), .text(key)])
+      }
+      // The trigger created before search_words existed does not clear it
+      database.run("DROP TRIGGER IF EXISTS items_gone")
+      database.run(Self.goneTrigger)
+      // Only the removed body read used it
+      database.run("DROP INDEX IF EXISTS items_long")
+    }
+    database.run("PRAGMA incremental_vacuum")
   }
 
   private func recount(_ tier: SizeTier) {
@@ -215,12 +268,15 @@ final class ClipboardStore: ObservableObject {
     for index in Self.indexes {
       // A full page leaves no room for the lower ranks
       guard found.count < Self.pageLimit else { break }
-      for item in match(in: index, needle: needle, tier: tier) where !seen.contains(item.id) {
+      let hits = index == "search_text"
+        ? matchText(needle: needle, tier: tier)
+        : match(in: index, needle: needle, tier: tier)
+      for item in hits where !seen.contains(item.id) {
         seen.insert(item.id)
         found.append(item)
       }
     }
-    return deepen(found, needle: needle, tier: tier, seen: seen)
+    return found
   }
 
   private func match(in index: String, needle: String, tier: SizeTier?) -> [ClipItem] {
@@ -240,39 +296,72 @@ final class ClipboardStore: ObservableObject {
     return rows
   }
 
-  /// Reads into the bodies of long entries when the index found under 20 rows
+  /// Text rank: the needle inside the preview, or its whole words anywhere in the
+  /// indexed text. We take the newest page of each and merge them by rowid
   ///
-  /// 15 entries at 16 KB each. Reading them whole froze the window: stored
-  /// bodies reach hundreds of megabytes and this runs on every keystroke
-  private func deepen(_ found: [ClipItem], needle: String, tier: SizeTier?,
-                      seen: Set<UUID>) -> [ClipItem] {
-    guard found.count < 20 else { return found }
-    var extra: [ClipItem] = []
+  /// A prefix match on the last word cost up to 11 ms at 900 000 entries. Whole
+  /// words cost under 3.4 ms, so a word still being typed matches the preview only
+  private func matchText(needle: String, tier: SizeTier?) -> [ClipItem] {
+    let words = needle.split(separator: "-")
+    guard !words.isEmpty else { return match(in: "search_text", needle: needle, tier: tier) }
+    // loose() leaves letters, digits and dashes, so neither phrase holds a quote
+    let phrases = ["\"\(needle)\"", "\"" + words.joined(separator: " ") + "\""]
     var values: [Database.Value] = []
-    var band = ""
-    if let tier {
-      band = "AND band = ?"
-      values.append(.int(tier.band))
+    var arms: [String] = []
+    for (index, phrase) in zip(["search_text", "search_words"], phrases) {
+      values.append(.text(phrase))
+      if let tier {
+        arms.append("""
+          SELECT \(index).rowid AS hit FROM \(index) JOIN items ON items.rowid = \(index).rowid
+          WHERE \(index) MATCH ? AND items.band = ? ORDER BY \(index).rowid DESC LIMIT ?
+          """)
+        values.append(.int(tier.band))
+      } else {
+        arms.append("SELECT rowid AS hit FROM \(index) WHERE \(index) MATCH ? ORDER BY rowid DESC LIMIT ?")
+      }
+      values.append(.int(Self.pageLimit))
     }
-    // Written into the statement rather than bound, so it matches the partial
-    // index above
+    values.append(.int(Self.pageLimit))
+    var rows: [ClipItem] = []
     database.each("""
-      SELECT \(Self.columns) FROM items
-      WHERE kind = 'text' AND length(preview) >= \(Self.previewLimit) \(band)
-      ORDER BY date DESC LIMIT 15
-      """, values) { extra.append(Self.item(from: $0)) }
-    let deep = extra.filter { !seen.contains($0.id) && Self.loose(head(of: $0)).contains(needle) }
-    return found + deep
+      SELECT \(Self.columns) FROM (
+        SELECT hit FROM (\(arms[0])) UNION SELECT hit FROM (\(arms[1])) ORDER BY hit DESC LIMIT ?
+      ) AS m JOIN items ON items.rowid = m.hit ORDER BY m.hit DESC
+      """, values) { rows.append(Self.item(from: $0)) }
+    return rows
   }
 
-  private func head(of item: ClipItem, bytes: Int = 16 << 10) -> String {
-    guard item.kind == .text, let url = fileURL(for: item),
-          let handle = try? FileHandle(forReadingFrom: url)
-    else { return item.preview }
-    defer { try? handle.close() }
-    guard let data = try? handle.read(upToCount: bytes) else { return item.preview }
-    return String(data: data, encoding: .utf8) ?? item.preview
+  /// Builds keys on every core and hands them to `insert` in order, 20 000 at a
+  /// time, so the keys of a million entries are never held at once
+  private nonisolated static func inChunks(_ count: Int, key: @escaping @Sendable (Int) -> String,
+                                           insert: (Int, String) -> Void) {
+    for lower in stride(from: 0, to: count, by: 20_000) {
+      let upper = min(lower + 20_000, count)
+      var keys = [String](repeating: "", count: upper - lower)
+      keys.withUnsafeMutableBufferPointer { buffer in
+        // Each iteration writes only its own slot
+        nonisolated(unsafe) let base = buffer.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: upper - lower) { base[$0] = key(lower + $0) }
+      }
+      for (offset, key) in keys.enumerated() { insert(lower + offset, key) }
+    }
   }
+
+  private func head(file: String?, preview: String, bytes: Int) -> String {
+    Self.head(of: file.map { bodies.appendingPathComponent($0) }, preview: preview, bytes: bytes)
+  }
+
+  private nonisolated static func head(of url: URL?, preview: String, bytes: Int) -> String {
+    guard let url, let handle = try? FileHandle(forReadingFrom: url) else { return preview }
+    defer { try? handle.close() }
+    guard let data = try? handle.read(upToCount: bytes) else { return preview }
+    // String(data:encoding:) returns nil when the cut splits a character, and
+    // the entry fell back to its preview
+    return String(decoding: data, as: UTF8.self)
+  }
+
+  /// Bytes of a text indexed as words
+  nonisolated static let searchLimit = 64 << 10
 
   /// Plain list, newest first, within the retention set for the quick list
   func recent(tier: SizeTier? = nil, limit: Int = ClipboardStore.pageLimit) -> [ClipItem] {
@@ -340,7 +429,7 @@ final class ClipboardStore: ObservableObject {
     let data = Data(text.utf8)
     guard data.count <= Settings.shared.maxItemBytes else { return }
     let digest = Self.digest(data)
-    if bump(digest) { return }
+    if bump(digest, source: source) { return }
     let name = UUID().uuidString + ".txt"
     guard (try? data.write(to: bodies.appendingPathComponent(name))) != nil else { return }
     // The body is stored as copied; the preview is flattened, or indented code
@@ -348,13 +437,14 @@ final class ClipboardStore: ObservableObject {
     let flat = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     insert(ClipItem(id: UUID(), kind: .text, date: Date(), bytes: data.count,
                     digest: digest, preview: String(flat.prefix(Self.previewLimit)),
-                    file: name, thumb: nil, source: source))
+                    file: name, thumb: nil, source: source),
+           text: String(decoding: data.prefix(Self.searchLimit), as: UTF8.self))
   }
 
   func add(png: Data, thumb: Data?, label: String, source: String?) {
     guard png.count <= Settings.shared.maxItemBytes else { return }
     let digest = Self.digest(png)
-    if bump(digest) { return }
+    if bump(digest, source: source) { return }
     let name = UUID().uuidString + ".png"
     guard (try? png.write(to: bodies.appendingPathComponent(name))) != nil else { return }
     var thumbName: String?
@@ -368,11 +458,14 @@ final class ClipboardStore: ObservableObject {
   }
 
   /// Re-copying an entry moves it back to the top instead of storing it twice
-  private func bump(_ digest: String) -> Bool {
+  ///
+  /// The copy came from another app, so the entry takes that app as its source.
+  /// A copy from our panel goes through touch and keeps the source it had
+  private func bump(_ digest: String, source: String?) -> Bool {
     guard let old = database.first(
       "SELECT \(Self.columns) FROM items WHERE digest = ?", [.text(digest)],
       { Self.item(from: $0) }) else { return false }
-    promote(old)
+    promote(old, source: source)
     return true
   }
 
@@ -386,24 +479,26 @@ final class ClipboardStore: ObservableObject {
 
   /// Delete and insert rather than UPDATE date: search orders by rowid, so
   /// recency has to be in rowid order too
-  private func promote(_ old: ClipItem) {
+  private func promote(_ old: ClipItem, source: String? = nil) {
     database.transaction {
       database.perform("DELETE FROM items WHERE id = ?", [.text(old.id.uuidString)])
       write(ClipItem(id: old.id, kind: old.kind, date: Date(), bytes: old.bytes,
                      digest: old.digest, preview: old.preview, file: old.file,
-                     thumb: old.thumb, source: old.source))
+                     thumb: old.thumb, source: source ?? old.source))
     }
     generation += 1
   }
 
-  private func insert(_ item: ClipItem) {
-    database.transaction { write(item) }
+  private func insert(_ item: ClipItem, text: String? = nil) {
+    database.transaction { write(item, text: text) }
     generation += 1
     applyLimits()
   }
 
   /// Writes the row and its three index entries; rowid links them
-  private func write(_ item: ClipItem) {
+  ///
+  /// A text is indexed from `text`. Without it we read the stored body again
+  private func write(_ item: ClipItem, text: String? = nil) {
     database.perform("""
       INSERT OR REPLACE INTO items (id, kind, date, bytes, digest, preview, file, thumb, source, band)
       VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -424,6 +519,10 @@ final class ClipboardStore: ObservableObject {
     for (index, key) in zip(Self.indexes, keys) {
       database.perform("INSERT INTO \(index)(rowid, text) VALUES (?,?)", [.int(rowid), .text(key)])
     }
+    guard item.kind == .text else { return }
+    let body = text ?? head(file: item.file, preview: item.preview, bytes: Self.searchLimit)
+    database.perform("INSERT INTO search_words(rowid, text) VALUES (?,?)",
+                     [.int(rowid), .text(Self.loose(body))])
   }
 
   // MARK: - Removing

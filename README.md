@@ -30,7 +30,7 @@ Works on macOS Sonoma 14 or higher.
 
 * Text and images, with thumbnails and the app each one came from
 * Search by content, source, date, time, size or image dimensions
-* Substring search, not just whole words
+* Part of a word matches in the preview, whole words match anywhere in the first 64 KB of a text
 * Separate retention for small and large entries, so screenshots expire before text does
 * Scales to millions of entries without slowing down or growing in memory
 * Keyboard driven, opens over any window without switching applications
@@ -82,7 +82,7 @@ The search field matches several things at once, so there is no syntax to learn:
 
 Entries whose **text** contains the query come first, then those whose **source app** matches, then those matching by **size or date**. Newest first within each group. A query that happens to look like a date does not push aside entries that actually contain those characters.
 
-Search covers the whole history, including entries older than the quick list shows, and reads into the body of long entries when their preview alone finds nothing.
+Search covers the whole history, including entries older than the quick list shows. Any part of a word is found in the first 400 characters of a text. Past that point, up to 64 KB, a text is found by whole words and phrases: `main()` finds `Future<void> main() async`, `mai` does not.
 
 ## Settings
 
@@ -212,8 +212,7 @@ Metadata is in SQLite, bodies are plain files beside it. A 100 MB image never pa
 | Trigram `fts5` index instead of the word tokenizer | `ermina` finds `Terminal`; the default tokenizer finds nothing |
 | Three index tables instead of three columns of one | A date query costs 0.1 ms instead of 96 ms at a million rows |
 | Counts and sizes maintained by triggers | Settings open in 0.02 ms instead of 24 ms |
-| Partial index for the deep read | 0.17 ms instead of 256 ms when a search matches nothing |
-| Body reads bounded to 16 KB from 15 entries | The window no longer freezes on a history of 160 MB entries |
+| Trigrams for the preview, a `unicode61` word index for the text up to 64 KB | 272 MB of index for 1 GB of text instead of 1669 MB for trigrams over the same text |
 | Thumbnails in AVIF where the system encodes it | ~1.5 KB per thumbnail instead of ~3.5 KB for JPEG, 2.3x less |
 | 300 decoded thumbnails cached, encoding off the main thread | Scrolling never waits on the disk or on the encoder |
 | 300 rows per query, answers cached per keystroke | The list is rebuilt once per redraw, not several times |
@@ -223,31 +222,35 @@ Metadata is in SQLite, bodies are plain files beside it. A 100 MB image never pa
 
 ### Measured
 
-On real stores of one and two million entries, 1.1 GB and 1.4 GB on disk:
+On a generated store of 900 000 entries and 18 GB, 90% of the default limits: texts cut from a real clipboard history, from a line to 8 MB, and images in every size band. The database file is 1.4 GB. Medians of three runs:
 
-| Operation | 1M entries | 2M entries |
-|---|---|---|
-| Open the store | 12.3 ms | 9.8 ms |
-| First page of the list | 0.6 ms | 0.7 ms |
-| Search a word | 1.7 ms | 2.7 ms |
-| Search inside a word | 1.1 ms | 1.3 ms |
-| Search matching nothing | 0.17 ms | 0.2 ms |
-| Find a duplicate by digest | 0.006 ms | 0.008 ms |
-| Store one copy | 1.8 ms | 1.1 ms |
-| Delete one entry | 0.25 ms | 0.14 ms |
-| Counters for the settings | 0.02 ms | 0.02 ms |
-| Apply the limits | 0.01 ms | 0.01 ms |
-| Memory held | 10 MB | 8.3 MB |
+| Operation | Time |
+|---|---|
+| Open the store | 10.2 ms |
+| First page of the list | 0.21 ms |
+| Search a word, `terminal` | 1.8 ms |
+| Search inside a word, `ermina` | 0.95 ms |
+| Search past the preview, `main()` | 0.84 ms |
+| Search matching nothing, `qqz` | 0.32 ms |
+| Find a duplicate by digest | 0.003 ms |
+| Store a 1 KB text | 0.73 ms |
+| Store a 1 MB text | 52 ms |
+| Store a copy when the count limit is reached | 1.2 ms |
+| Store a copy when the size limit is reached | 0.68 ms |
+| Delete one entry | 0.1 ms |
+| Counters for the settings | 0.016 ms |
+| Apply the limits | 0.044 ms |
+| Memory held after opening and searching | 3.4 MB |
 
-Typing into the search box, measured per character on the million-entry store:
+Typing into the search box, per character:
 
-| Typed | Before | After |
-|---|---|---|
-| `t` | 100.9 ms | 1.9 ms |
-| `te` | 37.4 ms | 1.9 ms |
-| `ter` | 12.9 ms | 1.1 ms |
-| `terminal` | 0.8 ms | 0.8 ms |
-| `qqz`, matching nothing | 65.2 ms | 9.7 ms |
+| Typed | Time |
+|---|---|
+| `t` | 1.7 ms |
+| `te` | 2.1 ms |
+| `ter` | 0.61 ms |
+| `terminal` | 1.8 ms |
+| `qqz`, matching nothing | 0.32 ms |
 
 A screen frame is 16 ms, so nothing here is visible while typing.
 
